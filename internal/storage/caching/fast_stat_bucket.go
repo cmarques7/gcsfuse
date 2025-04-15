@@ -319,6 +319,7 @@ func (b *fastStatBucket) StatObject(
 	if !req.ForceFetchFromGcs && req.ReturnExtendedObjectAttributes {
 		panic("invalid StatObjectRequest: ForceFetchFromGcs: false and ReturnExtendedObjectAttributes: true")
 	}
+
 	// If fetching from gcs is enabled, directly make a call to GCS.
 	if req.ForceFetchFromGcs {
 		m, e, err = b.StatObjectFromGcs(ctx, req)
@@ -344,89 +345,8 @@ func (b *fastStatBucket) StatObject(
 		return
 	}
 
-	return b.StatObjectFromGcs(ctx, req)
-}
-
-// LOCKS_EXCLUDED(b.mu)
-func (b *fastStatBucket) ListObjects(
-	ctx context.Context,
-	req *gcs.ListObjectsRequest) (listing *gcs.Listing, err error) {
-	// Fetch the listing.
-	listing, err = b.wrapped.ListObjects(ctx, req)
-	if err != nil {
-		return
-	}
-
-	if b.BucketType().Hierarchical {
-		b.insertHierarchicalListing(listing)
-		return
-	}
-
-	// note anything we found.
-	b.insertMultipleMinObjects(listing.MinObjects)
+	m, e, err = b.StatObjectFromGcs(ctx, req)
 	return
-}
-
-// LOCKS_EXCLUDED(b.mu)
-func (b *fastStatBucket) UpdateObject(
-	ctx context.Context,
-	req *gcs.UpdateObjectRequest) (o *gcs.Object, err error) {
-	// Throw away any existing record for this object.
-	b.invalidate(req.Name)
-
-	// Update the object.
-	o, err = b.wrapped.UpdateObject(ctx, req)
-	if err != nil {
-		return
-	}
-
-	// Record the new version.
-	b.insert(o)
-
-	return
-}
-
-// LOCKS_EXCLUDED(b.mu)
-func (b *fastStatBucket) DeleteObject(
-	ctx context.Context,
-	req *gcs.DeleteObjectRequest) (err error) {
-	err = b.wrapped.DeleteObject(ctx, req)
-	if err != nil {
-		b.invalidate(req.Name)
-	} else {
-		b.addNegativeEntry(req.Name)
-	}
-	return
-}
-
-func (b *fastStatBucket) MoveObject(ctx context.Context, req *gcs.MoveObjectRequest) (*gcs.Object, error) {
-	// Throw away any existing record for the source and destination name.
-	b.invalidate(req.SrcName)
-	b.invalidate(req.DstName)
-
-	// Move the object.
-	o, err := b.wrapped.MoveObject(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Record the new version.
-	b.insert(o)
-
-	return o, nil
-}
-
-func (b *fastStatBucket) DeleteFolder(ctx context.Context, folderName string) error {
-	err := b.wrapped.DeleteFolder(ctx, folderName)
-	// In case of an error; invalidate the cached entry. This will make sure that
-	// gcsfuse is not caching possibly erroneous status of the folder and next
-	// call will hit GCS backend to probe the latest status.
-	if err != nil {
-		b.invalidate(folderName)
-	} else {
-		b.addNegativeEntryForFolder(folderName)
-	}
-	return err
 }
 
 func (b *fastStatBucket) StatObjectFromGcs(ctx context.Context,
@@ -510,8 +430,86 @@ func (b *fastStatBucket) RenameFolder(ctx context.Context, folderName string, de
 	return f, err
 }
 
+func (b *fastStatBucket) MoveObject(ctx context.Context, req *gcs.MoveObjectRequest) (*gcs.Object, error) {
+	// Throw away any existing record for the source and destination name.
+	b.invalidate(req.SrcName)
+	b.invalidate(req.DstName)
+
+	// Move the object.
+	o, err := b.wrapped.MoveObject(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Record the new version.
+	b.insert(o)
+
+	return o, nil
+}
+
+func (b *fastStatBucket) DeleteObject(ctx context.Context, req *gcs.DeleteObjectRequest) (err error) {
+	err = b.wrapped.DeleteObject(ctx, req)
+	if err != nil {
+		b.invalidate(req.Name)
+	} else {
+		b.addNegativeEntry(req.Name)
+	}
+	return
+}
+
+func (b *fastStatBucket) DeleteFolder(ctx context.Context, folderName string) error {
+	err := b.wrapped.DeleteFolder(ctx, folderName)
+	// In case of an error; invalidate the cached entry. This will make sure that
+	// gcsfuse is not caching possibly erroneous status of the folder and next
+	// call will hit GCS backend to probe the latest status.
+	if err != nil {
+		b.invalidate(folderName)
+	} else {
+		b.addNegativeEntryForFolder(folderName)
+	}
+	return err
+}
+
 func (b *fastStatBucket) NewMultiRangeDownloader(
 	ctx context.Context, req *gcs.MultiRangeDownloaderRequest) (mrd gcs.MultiRangeDownloader, err error) {
 	mrd, err = b.wrapped.NewMultiRangeDownloader(ctx, req)
+	return
+}
+
+func (b *fastStatBucket) ListObjects(
+	ctx context.Context,
+	req *gcs.ListObjectsRequest) (listing *gcs.Listing, err error) {
+	// Fetch the listing.
+	listing, err = b.wrapped.ListObjects(ctx, req)
+	if err != nil {
+		return
+	}
+
+	if b.BucketType().Hierarchical {
+		b.insertHierarchicalListing(listing)
+		return
+	}
+
+	// note anything we found.
+	b.insertMultipleMinObjects(listing.MinObjects)
+	return
+}
+
+// LOCKS_EXCLUDED(b.mu)
+func (b *fastStatBucket) UpdateObject(
+	ctx context.Context,
+	req *gcs.UpdateObjectRequest) (o *gcs.Object, err error) {
+	// Throw away any existing record for this object.
+	b.invalidate(req.Name)
+
+	// Update the object.
+	o, err = b.wrapped.UpdateObject(ctx, req)
+	if err != nil {
+		return
+	}
+
+	// Record the new version.
+	b.insert(o)
+
 	return
 }
