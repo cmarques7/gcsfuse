@@ -206,6 +206,21 @@ func (f *FileInode) checkInvariants() {
 
 // LOCKS_REQUIRED(f.mu)
 func (f *FileInode) clobbered(ctx context.Context, forceFetchFromGcs bool, includeExtendedObjectAttributes bool) (o *gcs.Object, b bool, err error) {
+	// If we have local file cache enabled and we're not forcing a fetch from GCS,
+	// check if the file exists in the cache with the correct generation numbers
+	if f.localFileCache && !forceFetchFromGcs {
+		cacheObjectKey := &contentcache.CacheObjectKey{BucketName: f.bucket.Name(), ObjectName: f.name.objectName}
+		if cacheObject, exists := f.contentCache.Get(cacheObjectKey); exists {
+			if cacheObject.ValidateGeneration(f.src.Generation, f.src.MetaGeneration) {
+				// File exists in cache with matching generation numbers, so it's not clobbered
+				// Create a minimal object to return
+				o = storageutil.ConvertMinObjectToObject(&f.src)
+				b = false
+				return
+			}
+		}
+	}
+
 	// Stat the object in GCS. ForceFetchFromGcs ensures object is fetched from
 	// gcs and not cache.
 	req := &gcs.StatObjectRequest{
@@ -219,6 +234,7 @@ func (f *FileInode) clobbered(ctx context.Context, forceFetchFromGcs bool, inclu
 	} else {
 		o = storageutil.ConvertMinObjectToObject(m)
 	}
+
 	// Special case: "not found" means we have been clobbered.
 	var notFoundErr *gcs.NotFoundError
 	if errors.As(err, &notFoundErr) {
@@ -273,25 +289,21 @@ func (f *FileInode) openReader(ctx context.Context) (io.ReadCloser, error) {
 //
 // LOCKS_REQUIRED(f.mu)
 func (f *FileInode) ensureContent(ctx context.Context) (err error) {
+	// Already have content?
+	if f.content != nil {
+		return
+	}
+
+	// Make sure f.content != nil.
+	rc, err := f.openReader(ctx)
+	if err != nil {
+		err = fmt.Errorf("openReader Error: %w", err)
+		return err
+	}
+
 	if f.localFileCache {
-		// Fetch content from the cache after validating generation numbers again
-		// Generation validation first occurs at inode creation/destruction
-		cacheObjectKey := &contentcache.CacheObjectKey{BucketName: f.bucket.Name(), ObjectName: f.name.objectName}
-		if cacheObject, exists := f.contentCache.Get(cacheObjectKey); exists {
-			if cacheObject.ValidateGeneration(f.src.Generation, f.src.MetaGeneration) {
-				f.content = cacheObject.CacheFile
-				return
-			}
-		}
-
-		rc, err := f.openReader(ctx)
-		if err != nil {
-			err = fmt.Errorf("openReader Error: %w", err)
-			return err
-		}
-
 		// Insert object into content cache
-		tf, err := f.contentCache.AddOrReplace(cacheObjectKey, f.src.Generation, f.src.MetaGeneration, rc)
+		tf, err := f.contentCache.AddOrReplace(&contentcache.CacheObjectKey{BucketName: f.bucket.Name(), ObjectName: f.name.objectName}, f.src.Generation, f.src.MetaGeneration, rc)
 		if err != nil {
 			err = fmt.Errorf("AddOrReplace cache error: %w", err)
 			return err
@@ -301,16 +313,6 @@ func (f *FileInode) ensureContent(ctx context.Context) (err error) {
 		f.content = tf.CacheFile
 	} else {
 		// Local filecache is not enabled
-		if f.content != nil {
-			return
-		}
-
-		rc, err := f.openReader(ctx)
-		if err != nil {
-			err = fmt.Errorf("openReader Error: %w", err)
-			return err
-		}
-
 		tf, err := f.contentCache.NewTempFile(rc)
 		if err != nil {
 			err = fmt.Errorf("NewTempFile: %w", err)
@@ -320,7 +322,7 @@ func (f *FileInode) ensureContent(ctx context.Context) (err error) {
 		f.content = tf
 	}
 
-	return
+	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -509,10 +511,41 @@ func (f *FileInode) Attributes(
 
 	// If the object has been clobbered, we reflect that as the inode being
 	// unlinked.
-	_, clobbered, err := f.clobbered(ctx, false, false)
-	if err != nil {
-		err = fmt.Errorf("clobbered: %w", err)
-		return
+	clobbered := false
+	
+	// First check if we can determine clobbered status from the cache
+	if f.localFileCache {
+		cacheObjectKey := &contentcache.CacheObjectKey{BucketName: f.bucket.Name(), ObjectName: f.name.objectName}
+		if cacheObject, exists := f.contentCache.Get(cacheObjectKey); exists {
+			if cacheObject.ValidateGeneration(f.src.Generation, f.src.MetaGeneration) {
+				// File exists in cache with matching generation numbers, so it's not clobbered
+				clobbered = false
+			} else {
+				// If generations don't match, we need to check with GCS
+				_, clobberedResult, clobberedErr := f.clobbered(ctx, false, false)
+				if clobberedErr != nil {
+					err = fmt.Errorf("clobbered: %w", clobberedErr)
+					return
+				}
+				clobbered = clobberedResult
+			}
+		} else {
+			// If not in cache, we need to check with GCS
+			_, clobberedResult, clobberedErr := f.clobbered(ctx, false, false)
+			if clobberedErr != nil {
+				err = fmt.Errorf("clobbered: %w", clobberedErr)
+				return
+			}
+			clobbered = clobberedResult
+		}
+	} else {
+		// If local file cache is not enabled, fall back to the original behavior
+		_, clobberedResult, clobberedErr := f.clobbered(ctx, false, false)
+		if clobberedErr != nil {
+			err = fmt.Errorf("clobbered: %w", clobberedErr)
+			return
+		}
+		clobbered = clobberedResult
 	}
 
 	attrs.Nlink = 1

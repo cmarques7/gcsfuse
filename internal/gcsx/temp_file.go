@@ -95,6 +95,7 @@ func NewTempFile(
 		clock:          clock,
 		f:              f,
 		dirtyThreshold: 0,
+		name:           f.Name(),
 	}
 
 	return
@@ -115,6 +116,7 @@ func NewCacheFile(
 		clock:          clock,
 		f:              f,
 		dirtyThreshold: 0,
+		name:           f.Name(),
 	}
 
 	return
@@ -137,6 +139,7 @@ func RecoverCacheFile(
 		clock:          clock,
 		f:              source,
 		dirtyThreshold: stat.Size(),
+		name:           source.Name(),
 	}
 
 	return
@@ -178,6 +181,8 @@ type tempFile struct {
 	//
 	// INVARIANT: mtime == nil => Stat().DirtyThreshold == Stat().Size
 	mtime *time.Time
+
+	name string
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -243,29 +248,110 @@ func (tf *tempFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (tf *tempFile) ReadAt(p []byte, offset int64) (int, error) {
-	err := tf.ensureComplete()
-	if err != nil {
-		return 0, fmt.Errorf("cannot ReadAt incomplete file: %w", err)
+	// Only ensure the file is complete if it's not already in the complete state
+	if tf.state != fileComplete {
+		// Check if the file is physically complete before trying to modify it
+		if tf.source != nil {
+			// Get the current file size
+			size, err := tf.f.Seek(0, 2)
+			if err != nil {
+				return 0, fmt.Errorf("cannot determine file size: %w", err)
+			}
+			
+			// Reset the seek position
+			_, err = tf.f.Seek(offset, 0)
+			if err != nil {
+				return 0, fmt.Errorf("cannot reset seek position: %w", err)
+			}
+			
+			// If we have a source and the file size is already sufficient,
+			// we can mark it as complete without further modifications
+			if size >= offset + int64(len(p)) {
+				// File is already physically complete for this read
+				// Mark it as complete to avoid future modifications
+				if tf.state == fileIncomplete {
+					tf.state = fileComplete
+					if tf.source != nil {
+						tf.source.Close()
+						tf.source = nil
+					}
+				}
+			} else {
+				// File is not physically complete, ensure it is
+				err := tf.ensureComplete()
+				if err != nil {
+					return 0, fmt.Errorf("cannot ReadAt incomplete file: %w", err)
+				}
+			}
+		} else {
+			// No source, just ensure it's complete
+			err := tf.ensureComplete()
+			if err != nil {
+				return 0, fmt.Errorf("cannot ReadAt incomplete file: %w", err)
+			}
+		}
 	}
 	return tf.f.ReadAt(p, offset)
 }
 
 func (tf *tempFile) Stat() (sr StatResult, err error) {
-	err = tf.ensureComplete()
-	if err != nil {
-		err = fmt.Errorf("cannot Stat incomplete file: %w", err)
-		return
+	// Only ensure the file is complete if it's not already in the complete state
+	if tf.state != fileComplete {
+		// Check if the file is physically complete before trying to modify it
+		if tf.source != nil {
+			// Get the file info to check if it's physically complete
+			fi, statErr := tf.f.Stat()
+			if statErr == nil {
+				// If we have a source and the file exists and has content,
+				// we can mark it as complete without further modifications
+				if fi.Size() > 0 {
+					// File is already physically complete
+					// Mark it as complete to avoid future modifications
+					if tf.state == fileIncomplete {
+						tf.state = fileComplete
+						tf.dirtyThreshold = fi.Size()
+						if tf.source != nil {
+							tf.source.Close()
+							tf.source = nil
+						}
+					}
+					
+					// Set the result values
+					sr.DirtyThreshold = tf.dirtyThreshold
+					sr.Mtime = tf.mtime
+					sr.Size = fi.Size()
+					return
+				}
+			}
+			
+			// File is not physically complete or stat failed, ensure it is complete
+			err = tf.ensureComplete()
+			if err != nil {
+				err = fmt.Errorf("cannot Stat incomplete file: %w", err)
+				return
+			}
+		} else {
+			// No source, just ensure it's complete
+			err = tf.ensureComplete()
+			if err != nil {
+				err = fmt.Errorf("cannot Stat incomplete file: %w", err)
+				return
+			}
+		}
 	}
+	
 	sr.DirtyThreshold = tf.dirtyThreshold
 	sr.Mtime = tf.mtime
 
-	// Get the size from the file.
-	sr.Size, err = tf.f.Seek(0, 2)
+	// Get the size.
+	var fi os.FileInfo
+	fi, err = tf.f.Stat()
 	if err != nil {
-		err = fmt.Errorf("seek: %w", err)
+		err = fmt.Errorf("stat: %w", err)
 		return
 	}
 
+	sr.Size = fi.Size()
 	return
 }
 
@@ -310,7 +396,7 @@ func (tf *tempFile) SetMtime(mtime time.Time) {
 }
 
 func (tf *tempFile) Name() string {
-	return tf.f.Name()
+	return tf.name
 }
 
 ////////////////////////////////////////////////////////////////////////
